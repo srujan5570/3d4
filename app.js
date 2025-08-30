@@ -641,6 +641,12 @@ class VTKVisualizationDashboard_ThreeJS {
     enableSlicing() {
         if (!this.pointCloud) return;
         
+        // Clear any existing transitions
+        if (this.fadeTransition) {
+            clearInterval(this.fadeTransition);
+            this.fadeTransition = null;
+        }
+        
         // Store original material and colors for restoration
         if (!this.originalPointCloudMaterial) {
             this.originalPointCloudMaterial = this.pointCloud.material.clone();
@@ -654,6 +660,10 @@ class VTKVisualizationDashboard_ThreeJS {
             }
         }
         
+        // Ensure material supports transparency and clipping
+        this.pointCloud.material.transparent = true;
+        this.pointCloud.material.alphaTest = 0.001;
+        
         // Create clipping plane
         this.slicingPlane = new THREE.Plane();
         this.updateSlicing();
@@ -662,17 +672,34 @@ class VTKVisualizationDashboard_ThreeJS {
     disableSlicing() {
         if (!this.pointCloud) return;
         
+        // Clear any running transitions
+        if (this.clippingTransition) {
+            clearInterval(this.clippingTransition);
+            this.clippingTransition = null;
+        }
+        
+        // Remove cross-section helper
+        if (this.crossSectionHelper) {
+            this.scene.remove(this.crossSectionHelper);
+            this.crossSectionHelper = null;
+        }
+        
         // Restore original material
         if (this.originalPointCloudMaterial) {
             this.pointCloud.material = this.originalPointCloudMaterial.clone();
         }
         
-        // Remove clipping planes
+        // Remove all clipping planes
+        this.pointCloud.material.clippingPlanes = [];
+        this.pointCloud.material.clipShadows = false;
         this.renderer.localClippingEnabled = false;
         this.slicingPlane = null;
         
-        // Reset point visibility
+        // Reset point visibility with smooth transition
         this.resetPointVisibility();
+        
+        // Add smooth fade-in effect
+        this.addFadeInTransition();
     }
 
     updateSlicing() {
@@ -728,6 +755,70 @@ class VTKVisualizationDashboard_ThreeJS {
     }
 
     applySlicingMode(mode, axis, position, thickness, box, extendedBox) {
+        const extendedSize = extendedBox.getSize(new THREE.Vector3());
+        
+        // Calculate slice position in world coordinates
+        let slicePos = new THREE.Vector3();
+        let normal = new THREE.Vector3();
+        
+        switch(axis) {
+            case 'x':
+                slicePos.x = extendedBox.min.x + extendedSize.x * position;
+                slicePos.y = box.getCenter(new THREE.Vector3()).y;
+                slicePos.z = box.getCenter(new THREE.Vector3()).z;
+                normal.set(1, 0, 0);
+                break;
+            case 'y':
+                slicePos.x = box.getCenter(new THREE.Vector3()).x;
+                slicePos.y = extendedBox.min.y + extendedSize.y * position;
+                slicePos.z = box.getCenter(new THREE.Vector3()).z;
+                normal.set(0, 1, 0);
+                break;
+            case 'z':
+                slicePos.x = box.getCenter(new THREE.Vector3()).x;
+                slicePos.y = box.getCenter(new THREE.Vector3()).y;
+                slicePos.z = extendedBox.min.z + extendedSize.z * position;
+                normal.set(0, 0, 1);
+                break;
+        }
+        
+        // Apply different clipping modes
+        switch(mode) {
+            case 'hide':
+                this.applyHardClipping(slicePos, normal);
+                break;
+                
+            case 'transparent':
+                this.applyTransparentClipping(slicePos, normal, position, axis, extendedBox);
+                break;
+                
+            case 'highlight':
+                this.applyHighlightClipping(slicePos, normal, thickness, position, axis, extendedBox);
+                break;
+                
+            case 'cross_section':
+                this.applyCrossSectionClipping(slicePos, normal, thickness, position, axis, extendedBox);
+                break;
+        }
+    }
+    
+    applyHardClipping(slicePos, normal) {
+        // Create clipping plane for hard cut
+        const clippingPlane = new THREE.Plane(normal, -normal.dot(slicePos));
+        
+        // Apply clipping plane to material
+        this.pointCloud.material.clippingPlanes = [clippingPlane];
+        this.pointCloud.material.clipShadows = true;
+        
+        // Enable local clipping
+        this.renderer.localClippingEnabled = true;
+        
+        // Add smooth transition effect
+        this.addClippingTransition();
+    }
+    
+    applyTransparentClipping(slicePos, normal, position, axis, extendedBox) {
+        // Use both clipping plane and transparency
         const geometry = this.pointCloud.geometry;
         const positions = geometry.attributes.position;
         const colors = geometry.attributes.color;
@@ -743,7 +834,6 @@ class VTKVisualizationDashboard_ThreeJS {
                 positions.getZ(i)
             );
             
-            // Calculate normalized position along the slice axis using extended bounds
             let normalizedPos;
             switch(axis) {
                 case 'x':
@@ -757,59 +847,132 @@ class VTKVisualizationDashboard_ThreeJS {
                     break;
             }
             
-            // Check if point is within slice thickness
-            const distanceFromSlice = Math.abs(normalizedPos - position);
-            const isInSlice = distanceFromSlice <= thickness / 2;
+            // Create smooth transparency gradient
+            const distance = Math.abs(normalizedPos - position);
+            const fadeRange = 0.1; // 10% fade range
             
-            // Apply mode-specific effects
-            switch(mode) {
-                case 'hide':
-                    if (normalizedPos > position) {
-                        colors.setXYZ(i, 0, 0, 0); // Make invisible
-                        colors.setW(i, 0); // Set alpha to 0
-                    } else {
-                        // Restore original color
-                        this.restoreOriginalColor(i, colors);
-                    }
-                    break;
-                    
-                case 'transparent':
-                    if (normalizedPos > position) {
-                        colors.setW(i, 0.2); // Make more transparent
-                    } else {
-                        colors.setW(i, 1.0); // Full opacity
-                    }
-                    break;
-                    
-                case 'highlight':
-                    if (isInSlice) {
-                        colors.setXYZ(i, 1, 1, 0); // Yellow highlight
-                    } else {
-                        this.restoreOriginalColor(i, colors);
-                    }
-                    break;
-                    
-                case 'cross_section':
-                    if (isInSlice) {
-                        // Keep original color for cross-section
-                        this.restoreOriginalColor(i, colors);
-                        colors.setW(i, 1.0);
-                    } else {
-                        // Hide everything else
-                        colors.setXYZ(i, 0, 0, 0);
-                        colors.setW(i, 0);
-                    }
-                    break;
+            if (normalizedPos > position + fadeRange) {
+                colors.setW(i, 0.1); // Very transparent
+            } else if (normalizedPos > position) {
+                // Smooth transition
+                const alpha = 1.0 - (distance / fadeRange) * 0.9;
+                colors.setW(i, alpha);
+            } else {
+                colors.setW(i, 1.0); // Full opacity
             }
         }
         
         colors.needsUpdate = true;
+        this.pointCloud.material.transparent = true;
+        this.renderer.localClippingEnabled = false;
+    }
+    
+    applyHighlightClipping(slicePos, normal, thickness, position, axis, extendedBox) {
+        const geometry = this.pointCloud.geometry;
+        const positions = geometry.attributes.position;
+        const colors = geometry.attributes.color;
         
-        // Enable transparency if needed
-        if (mode === 'transparent' || mode === 'cross_section') {
-            this.pointCloud.material.transparent = true;
-            this.pointCloud.material.opacity = 1.0;
+        if (!positions || !colors) return;
+        
+        const extendedSize = extendedBox.getSize(new THREE.Vector3());
+        
+        for (let i = 0; i < positions.count; i++) {
+            const point = new THREE.Vector3(
+                positions.getX(i),
+                positions.getY(i),
+                positions.getZ(i)
+            );
+            
+            let normalizedPos;
+            switch(axis) {
+                case 'x':
+                    normalizedPos = (point.x - extendedBox.min.x) / extendedSize.x;
+                    break;
+                case 'y':
+                    normalizedPos = (point.y - extendedBox.min.y) / extendedSize.y;
+                    break;
+                case 'z':
+                    normalizedPos = (point.z - extendedBox.min.z) / extendedSize.z;
+                    break;
+            }
+            
+            const distanceFromSlice = Math.abs(normalizedPos - position);
+            const isInSlice = distanceFromSlice <= thickness / 2;
+            
+            if (isInSlice) {
+                // Bright highlight with pulsing effect
+                const intensity = 0.8 + 0.2 * Math.sin(Date.now() * 0.005);
+                colors.setXYZ(i, intensity, intensity, 0); // Pulsing yellow
+            } else {
+                this.restoreOriginalColor(i, colors);
+            }
         }
+        
+        colors.needsUpdate = true;
+        this.renderer.localClippingEnabled = false;
+    }
+    
+    applyCrossSectionClipping(slicePos, normal, thickness, position, axis, extendedBox) {
+        // Create two clipping planes for cross-section
+        const offset = thickness * 0.5;
+        const plane1 = new THREE.Plane(normal, -normal.dot(slicePos) + offset);
+        const plane2 = new THREE.Plane(normal.clone().negate(), normal.dot(slicePos) + offset);
+        
+        this.pointCloud.material.clippingPlanes = [plane1, plane2];
+        this.pointCloud.material.clipShadows = true;
+        this.renderer.localClippingEnabled = true;
+        
+        // Add cross-section highlighting
+        this.addCrossSectionHighlight(slicePos, normal);
+    }
+    
+    addClippingTransition() {
+        // Add smooth transition animation
+        if (this.clippingTransition) {
+            clearInterval(this.clippingTransition);
+        }
+        
+        let progress = 0;
+        this.clippingTransition = setInterval(() => {
+            progress += 0.05;
+            if (progress >= 1) {
+                clearInterval(this.clippingTransition);
+                this.clippingTransition = null;
+                return;
+            }
+            
+            // Smooth easing function
+            const eased = 1 - Math.pow(1 - progress, 3);
+            
+            // Update material properties for smooth transition
+            if (this.pointCloud && this.pointCloud.material) {
+                this.pointCloud.material.opacity = 0.9 + 0.1 * eased;
+            }
+        }, 16); // 60fps
+    }
+    
+    addCrossSectionHighlight(slicePos, normal) {
+        // Create a visual indicator for the cross-section plane
+        if (this.crossSectionHelper) {
+            this.scene.remove(this.crossSectionHelper);
+        }
+        
+        const size = this.pointCloud ? 
+            new THREE.Box3().setFromObject(this.pointCloud).getSize(new THREE.Vector3()).length() * 0.5 : 10;
+        
+        const geometry = new THREE.PlaneGeometry(size, size);
+        const material = new THREE.MeshBasicMaterial({
+            color: 0x00ff00,
+            transparent: true,
+            opacity: 0.2,
+            side: THREE.DoubleSide
+        });
+        
+        this.crossSectionHelper = new THREE.Mesh(geometry, material);
+        this.crossSectionHelper.position.copy(slicePos);
+        this.crossSectionHelper.lookAt(slicePos.clone().add(normal));
+        
+        this.scene.add(this.crossSectionHelper);
     }
 
     restoreOriginalColor(index, colors) {
@@ -824,14 +987,58 @@ class VTKVisualizationDashboard_ThreeJS {
         if (!this.pointCloud) return;
         
         const colors = this.pointCloud.geometry.attributes.color;
-        if (colors) {
+        if (colors && this.originalPointColors) {
+            // Restore original colors completely
             for (let i = 0; i < colors.count; i++) {
-                colors.setW(i, 1.0); // Reset alpha to full opacity
+                const idx = i * 4;
+                if (idx + 3 < this.originalPointColors.length) {
+                    colors.setXYZW(i, 
+                        this.originalPointColors[idx],
+                        this.originalPointColors[idx + 1], 
+                        this.originalPointColors[idx + 2],
+                        this.originalPointColors[idx + 3]
+                    );
+                } else {
+                    colors.setW(i, 1.0); // Fallback to full opacity
+                }
+            }
+            colors.needsUpdate = true;
+        } else if (colors) {
+            // Fallback: just reset alpha
+            for (let i = 0; i < colors.count; i++) {
+                colors.setW(i, 1.0);
             }
             colors.needsUpdate = true;
         }
         
         this.pointCloud.material.transparent = false;
+        this.pointCloud.material.opacity = 1.0;
+    }
+    
+    addFadeInTransition() {
+        if (!this.pointCloud) return;
+        
+        // Clear any existing fade transition
+        if (this.fadeTransition) {
+            clearInterval(this.fadeTransition);
+        }
+        
+        let progress = 0;
+        this.pointCloud.material.opacity = 0.3;
+        
+        this.fadeTransition = setInterval(() => {
+            progress += 0.08;
+            if (progress >= 1) {
+                this.pointCloud.material.opacity = 1.0;
+                clearInterval(this.fadeTransition);
+                this.fadeTransition = null;
+                return;
+            }
+            
+            // Smooth easing function for fade-in
+            const eased = Math.pow(progress, 2);
+            this.pointCloud.material.opacity = 0.3 + 0.7 * eased;
+        }, 16); // 60fps
     }
 
     quickSlice(type) {
